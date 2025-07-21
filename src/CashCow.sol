@@ -6,8 +6,11 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {ERC2771Context} from "@openzeppelin/contracts/metatx/ERC2771Context.sol";
+import {Context} from "@openzeppelin/contracts/utils/Context.sol";
 
-contract CashCow is Ownable, EIP712 {
+contract CashCow is Ownable, EIP712, IERC165, ERC2771Context {
     using Strings for uint256;
     using SafeERC20 for IERC20;
 
@@ -58,18 +61,22 @@ contract CashCow is Ownable, EIP712 {
         uint256 indexed onChainGameId,
         address indexed player,
         uint256 betAmount,
-        address betToken,
+        address indexed betToken,
         bytes32 gameSeedHash
     );
 
     /// @notice Emitted when a payout is sent to a player
-    event PayoutSent(uint256 indexed onChainGameId, uint256 amount, address token, address indexed recipient);
+    event PayoutSent(uint256 indexed onChainGameId, uint256 amount, address indexed token, address indexed recipient);
 
     /// @notice Emitted when a game status is updated
     event GameStatusUpdated(uint256 indexed onChainGameId, GameStatus status);
 
     /// @notice Emitted when funds are deposited directly into the contract
     event DepositReceived(address indexed sender, uint256 amount, address indexed token);
+
+    /// @notice Treasury events
+    event TreasuryDeposit(uint256 amount, address indexed token);
+    event TreasuryWithdrawal(uint256 amount, address indexed token);
 
     // ===================
     // Errors
@@ -87,8 +94,11 @@ contract CashCow is Ownable, EIP712 {
     /// @notice Error when game is not in active status
     error GameNotActive();
 
-    /// @notice Error when payout fails
-    error PayoutFailed();
+    /// @notice Error when the bet is nul
+    error NullBet();
+
+    /// @notice Error if the payout amount is null
+    error InvalidPayout();
 
     /// @notice Error when server signature is invalid or doesn't match expected signer
     error InvalidServerSignature();
@@ -110,7 +120,11 @@ contract CashCow is Ownable, EIP712 {
      * @dev Initializer sets the contract owner and initial server signer address
      * @param _owner The contract admin
      */
-    constructor(address _owner) Ownable(_owner) EIP712("CashCow", "1") {
+    constructor(address _owner, address _trustedForwarder)
+        Ownable(_owner)
+        EIP712("CashCow", "1")
+        ERC2771Context(_trustedForwarder)
+    {
         gameCounter = 0;
     }
 
@@ -144,26 +158,36 @@ contract CashCow is Ownable, EIP712 {
         uint256 betAmount,
         address betToken,
         uint256 deadline
-    ) internal pure returns (bytes32) {
+    ) public pure returns (bytes32) {
         return keccak256(
-            abi.encode(CREATE_TYPEHASH, gameId, gameSeedHash, algoVersion, user, betAmount, betToken, deadline)
+            abi.encode(
+                CREATE_TYPEHASH,
+                keccak256(bytes(gameId)),
+                gameSeedHash,
+                keccak256(bytes(algoVersion)),
+                user,
+                betAmount,
+                betToken,
+                deadline
+            )
         );
     }
 
     function hashCashoutGame(uint256 onChainGameId, uint256 payoutAmount, string calldata gameSeed, uint256 deadline)
-        internal
+        public
         pure
         returns (bytes32)
     {
-        return keccak256(abi.encode(CASHOUT_TYPEHASH, onChainGameId, payoutAmount, gameSeed, deadline));
+        return
+            keccak256(abi.encode(CASHOUT_TYPEHASH, onChainGameId, payoutAmount, keccak256(bytes(gameSeed)), deadline));
     }
 
-    function hashLostGame(uint256 onChainGameId, string calldata gameSeed, uint256 deadline)
-        internal
+    function hashGameLoss(uint256 onChainGameId, string calldata gameSeed, uint256 deadline)
+        public
         pure
         returns (bytes32)
     {
-        return keccak256(abi.encode(LOSS_TYPEHASH, onChainGameId, gameSeed, deadline));
+        return keccak256(abi.encode(LOSS_TYPEHASH, onChainGameId, keccak256(bytes(gameSeed)), deadline));
     }
 
     /**
@@ -187,21 +211,22 @@ contract CashCow is Ownable, EIP712 {
         bytes calldata serverSignature
     ) external checkDeadline(deadline) {
         {
+            if (bet == 0) revert NullBet();
             if (treasury[token] <= bet) revert InsufficientFunds();
             if (preliminaryToOnChainId[preliminaryGameId] != 0) revert GameAlreadyExists();
 
             bytes32 messageHash =
-                hashCreateGame(preliminaryGameId, gameSeedHash, algoVersion, msg.sender, bet, token, deadline);
+                hashCreateGame(preliminaryGameId, gameSeedHash, algoVersion, _msgSender(), bet, token, deadline);
             _verifyAnyAdminSignature(messageHash, serverSignature);
         }
 
         {
-            IERC20(token).safeTransferFrom(msg.sender, address(this), bet);
+            IERC20(token).safeTransferFrom(_msgSender(), address(this), bet);
 
             gameCounter += 1;
             preliminaryToOnChainId[preliminaryGameId] = gameCounter;
             games[gameCounter] = Game({
-                player: msg.sender,
+                player: _msgSender(),
                 betAmount: bet,
                 betToken: token,
                 gameSeedHash: gameSeedHash,
@@ -213,7 +238,7 @@ contract CashCow is Ownable, EIP712 {
             });
         }
 
-        emit GameCreated(preliminaryGameId, gameCounter, msg.sender, bet, token, gameSeedHash);
+        emit GameCreated(preliminaryGameId, gameCounter, _msgSender(), bet, token, gameSeedHash);
     }
 
     /**
@@ -234,27 +259,28 @@ contract CashCow is Ownable, EIP712 {
         Game storage game = games[onChainGameId];
 
         // verify data
-        if (game.player == address(0)) {
-            revert GameDoesNotExist();
-        }
-        if (game.status != GameStatus.Active) {
-            revert GameNotActive();
-        }
-        assert(payoutAmount > 0);
+        if (game.player == address(0)) revert GameDoesNotExist();
+        if (game.status != GameStatus.Active) revert GameNotActive();
+        if (payoutAmount == 0) revert InvalidPayout();
 
         address playerAddress = game.player;
-        if (!_isOwner(msg.sender)) {
-            require(msg.sender == playerAddress, "Not authorized");
+        if (!_isOwner(_msgSender())) {
+            _checkIsPlayer(playerAddress);
             bytes32 messageHash = hashCashoutGame(onChainGameId, payoutAmount, gameSeed, deadline);
             _verifyAnyAdminSignature(messageHash, serverSignature);
         }
 
-        // --- EFFECTS (set state before external call) ---
+        // process payout
         game.status = GameStatus.Won;
         game.payoutAmount = payoutAmount;
-        game.gameSeed = gameSeed; // Store the game seed
+        game.gameSeed = gameSeed;
 
-        // --- PAYOUT ---
+        if (payoutAmount > game.betAmount) {
+            // check if the treasury can pay
+            uint256 paidFromTreasury = payoutAmount - game.betAmount;
+            if (paidFromTreasury > treasury[game.betToken]) revert InsufficientTreasuryFunds();
+            treasury[game.betToken] -= paidFromTreasury;
+        }
         IERC20(game.betToken).safeTransfer(playerAddress, payoutAmount);
 
         emit GameStatusUpdated(onChainGameId, GameStatus.Won);
@@ -283,9 +309,9 @@ contract CashCow is Ownable, EIP712 {
         }
         address playerAddress = game.player;
 
-        if (!_isOwner(msg.sender)) {
-            require(msg.sender == playerAddress, "Not authorized");
-            bytes32 messageHash = hashLostGame(onChainGameId, gameSeed, deadline);
+        if (!_isOwner(_msgSender())) {
+            _checkIsPlayer(playerAddress);
+            bytes32 messageHash = hashGameLoss(onChainGameId, gameSeed, deadline);
             _verifyAnyAdminSignature(messageHash, serverSignature);
         }
 
@@ -324,13 +350,25 @@ contract CashCow is Ownable, EIP712 {
 
     function addToTreasury(uint256 amount, address token) external onlyOwner {
         treasury[token] += amount;
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(token).safeTransferFrom(_msgSender(), address(this), amount);
+
+        emit TreasuryDeposit(amount, token);
     }
 
     function removeFromTreasury(uint256 amount, address token, address recipient) external onlyOwner {
         if (treasury[token] < amount) revert InsufficientTreasuryFunds();
         treasury[token] -= amount;
         IERC20(token).safeTransfer(recipient, amount);
+
+        emit TreasuryWithdrawal(amount, token);
+    }
+
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+
+    function balance(address token) external view returns (uint256) {
+        return IERC20(token).balanceOf(address(this)) - treasury[token];
     }
 
     // ===============================
@@ -344,12 +382,29 @@ contract CashCow is Ownable, EIP712 {
      * @param _signature The signature bytes (expected length 65).
      */
     function _verifyAnyAdminSignature(bytes32 _hash, bytes calldata _signature) internal view {
-        if (!SignatureChecker.isValidSignatureNow(owner(), _hash, _signature)) {
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), _hash));
+        if (!SignatureChecker.isValidSignatureNow(owner(), digest, _signature)) {
             revert InvalidServerSignature();
         }
     }
 
     function _isOwner(address user) internal view returns (bool) {
         return owner() == user;
+    }
+
+    function _checkIsPlayer(address player) internal view {
+        if (_msgSender() != player) revert NotGamePlayer();
+    }
+
+    function _msgSender() internal view override(ERC2771Context, Context) returns (address) {
+        return ERC2771Context._msgSender();
+    }
+
+    function _msgData() internal view override(ERC2771Context, Context) returns (bytes calldata) {
+        return ERC2771Context._msgData();
+    }
+
+    function _contextSuffixLength() internal view override(ERC2771Context, Context) returns (uint256) {
+        return ERC2771Context._contextSuffixLength();
     }
 }

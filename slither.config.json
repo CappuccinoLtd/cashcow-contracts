@@ -1,0 +1,8 @@
+{
+  "filter_paths": "(lib/|test/)",
+  "exclude_informational": false,
+  "solc_remaps": [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "create3-factory/=lib/create3-factory/"
+  ]
+}
