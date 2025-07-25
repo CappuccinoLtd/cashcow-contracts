@@ -16,6 +16,15 @@ This repository contains the core smart contracts for CashCow V1.
 - Multi-game setup with a single contract.
 - On-chain provable outcome.
 
+## Deployment
+To deploy the CashCow contract on an EVM-compatible chain, run the following script:
+
+```bash
+forge script script/CashCowDeploy.s.sol --rpc-url "$RPC_URL" --broadcast --slow --private-key "$OWNER_PRIVATE_KEY" --sender "$OWNER" --verify --verifier etherscan --etherscan-api-key "$ETHERSCAN_KEY"
+```
+
+> Make sure the env vars are correctly set in your `.env` file!
+
 ## Security
 
 > Audit reports are available in the _audits_ folder.
