@@ -11,7 +11,6 @@ contract CashCowDeployScript is Script {
     address owner = vm.envAddress("OWNER");
     uint256 ownerPrivateKey = vm.envUint("OWNER_PRIVATE_KEY");
     address create3Factory = vm.envAddress("CREATE3_FACTORY");
-    address trustedForwarder = vm.envAddress("TRUSTED_FORWARDER");
 
     function run() external {
         vm.startBroadcast(ownerPrivateKey);
@@ -27,8 +26,7 @@ contract CashCowDeployScript is Script {
         }
 
         console2.log("Deploying CashCow...");
-        address contractAddr =
-            factory.deploy(salt, abi.encodePacked(type(CashCow).creationCode, abi.encode(owner, trustedForwarder)));
+        address contractAddr = factory.deploy(salt, abi.encodePacked(type(CashCow).creationCode, abi.encode(owner)));
         console2.log("CashCow deployed: ", contractAddr);
 
         vm.stopBroadcast();

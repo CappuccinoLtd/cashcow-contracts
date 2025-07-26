@@ -13,7 +13,6 @@ contract CashCowTest is Test {
     ERC20Mock public usdc;
     address public owner;
     uint256 public ownerPrivateKey;
-    address public trustedForwarder;
     address public player1;
     address public player2;
     address public attacker;
@@ -22,24 +21,27 @@ contract CashCowTest is Test {
     uint256 constant INITIAL_TREASURY = 10000e6; // 10,000 USDC
     uint256 constant BET_AMOUNT = 100e6; // 100 USDC
     uint256 constant PAYOUT_AMOUNT = 200e6; // 200 USDC
+    uint256 constant MIN_BET = 10e6; // 10 USDC
 
-    // Events to test
+    // Events to test - Updated to match new contract
     event GameCreated(
-        string preliminaryGameId,
-        uint256 indexed onChainGameId,
+        bytes32 indexed gameId,
         address indexed player,
         uint256 betAmount,
         address indexed betToken,
         bytes32 gameSeedHash
     );
-    event PayoutSent(uint256 indexed onChainGameId, uint256 amount, address indexed token, address indexed recipient);
-    event GameStatusUpdated(uint256 indexed onChainGameId, CashCow.GameStatus status);
+    event GameWon(bytes32 indexed gameId, address indexed player, uint256 amount, address indexed token);
+    event GameLost(bytes32 indexed gameId, address indexed player);
+    event GameExpired(bytes32 indexed gameId, address indexed player);
+    event MinBetUpdated(address indexed token, uint256 minBet);
+    event TreasuryDeposit(uint256 amount, address indexed token);
+    event TreasuryWithdrawal(uint256 amount, address indexed token);
 
     constructor() {
         // Set up accounts
         ownerPrivateKey = 0xA11CE;
         owner = vm.addr(ownerPrivateKey);
-        trustedForwarder = makeAddr("trustedForwarder");
         player1 = makeAddr("player1");
         player2 = makeAddr("player2");
         attacker = makeAddr("attacker");
@@ -49,287 +51,315 @@ contract CashCowTest is Test {
     }
 
     function setUp() public {
-        casino = new CashCow(owner, trustedForwarder);
+        casino = new CashCow(owner);
 
         // Set up initial balances
         usdc.mint(owner, INITIAL_TREASURY);
         usdc.mint(player1, 1000e6);
         usdc.mint(player2, 1000e6);
 
-        // Owner adds initial treasury
+        // Owner adds initial treasury and sets min bet
         vm.startPrank(owner);
         usdc.approve(address(casino), INITIAL_TREASURY);
         casino.addToTreasury(INITIAL_TREASURY, address(usdc));
+        casino.updateMinBet(address(usdc), MIN_BET);
         vm.stopPrank();
     }
 
     // ========== HELPER FUNCTIONS ==========
 
     function signCreateGame(
-        string memory gameId,
         bytes32 gameSeedHash,
-        string memory algoVersion,
-        address user,
+        bytes32 gameId,
         uint256 betAmount,
         address betToken,
+        address player,
         uint256 deadline
     ) public view returns (bytes memory) {
-        bytes32 structHash =
-            casino.hashCreateGame(gameId, gameSeedHash, algoVersion, user, betAmount, betToken, deadline);
+        bytes32 structHash = casino.hashCreateGame(gameSeedHash, gameId, betAmount, betToken, player, deadline);
         bytes32 domainSeparator = casino.domainSeparator();
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function signCashout(uint256 onChainGameId, uint256 payoutAmount, string memory gameSeed, uint256 deadline)
-        internal
-        view
-        returns (bytes memory)
-    {
-        bytes32 structHash = casino.hashCashoutGame(onChainGameId, payoutAmount, gameSeed, deadline);
+    function signCashout(
+        string memory gameSeed,
+        bytes32 gameId,
+        uint256 payoutAmount,
+        address betToken,
+        address player,
+        uint256 deadline
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = casino.hashCashoutGame(gameSeed, gameId, payoutAmount, betToken, player, deadline);
         bytes32 domainSeparator = casino.domainSeparator();
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function signLoss(uint256 onChainGameId, string memory gameSeed, uint256 deadline)
-        internal
-        view
-        returns (bytes memory)
-    {
-        bytes32 structHash = casino.hashGameLoss(onChainGameId, gameSeed, deadline);
+    function signLoss(
+        string memory gameSeed,
+        bytes32 gameId,
+        uint256 betAmount,
+        address betToken,
+        address player,
+        uint256 deadline
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = casino.hashGameLoss(gameSeed, gameId, betAmount, betToken, player, deadline);
         bytes32 domainSeparator = casino.domainSeparator();
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function createGame(address player, string memory gameId) internal returns (uint256) {
+    function createGame(address player, bytes32 gameId) internal returns (bytes32) {
         bytes32 gameSeedHash = keccak256("test_seed");
         uint256 deadline = block.timestamp + 1 hours;
+        bytes32 extra = bytes32(uint256(1)); // Some extra data
 
-        bytes memory signature = signCreateGame(gameId, gameSeedHash, "v1", player, BET_AMOUNT, address(usdc), deadline);
+        bytes memory signature = signCreateGame(gameSeedHash, gameId, BET_AMOUNT, address(usdc), player, deadline);
 
         vm.startPrank(player);
         usdc.approve(address(casino), BET_AMOUNT);
 
-        vm.expectEmit(true, true, false, true);
-        emit GameCreated(gameId, casino.gameCounter() + 1, player, BET_AMOUNT, address(usdc), gameSeedHash);
+        vm.expectEmit(true, true, true, true);
+        emit GameCreated(gameId, player, BET_AMOUNT, address(usdc), gameSeedHash);
 
-        casino.createGame(gameId, gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
+        casino.createGame(gameSeedHash, gameId, BET_AMOUNT, address(usdc), player, extra, signature, deadline);
         vm.stopPrank();
 
-        return casino.gameCounter();
+        return gameId;
     }
 
     // ========== BASIC FUNCTIONALITY TESTS ==========
 
     function testCreateGame() public {
         assertEq(casino.treasury(address(usdc)), INITIAL_TREASURY);
+        assertEq(casino.locked(address(usdc)), 0);
 
-        uint256 gameId = createGame(player1, "game1");
+        bytes32 gameId = keccak256("game1");
+        createGame(player1, gameId);
 
-        assertEq(gameId, 1);
-        assertEq(casino.preliminaryToOnChainId("game1"), 1);
-
-        CashCow.Game memory game = casino.getGameDetails(1);
+        CashCow.Game memory game = casino.getGameDetails(gameId);
         assertEq(game.player, player1);
         assertEq(game.betAmount, BET_AMOUNT);
         assertEq(game.betToken, address(usdc));
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Active));
+        assertEq(uint256(game.status), uint256(CashCow.GameStatus.ACTIVE));
         assertEq(game.payoutAmount, 0);
+
+        // Check that locked funds increased
+        assertEq(casino.locked(address(usdc)), BET_AMOUNT);
     }
 
-    function testCashoutByOwner() public {
-        uint256 gameId = createGame(player1, "game1");
+    function testCashoutWithSignature() public {
+        bytes32 gameId = keccak256("game1");
+        createGame(player1, gameId);
+
         uint256 playerBalanceBefore = usdc.balanceOf(player1);
-        uint256 contractBalanceBefore = usdc.balanceOf(address(casino));
         uint256 treasuryBefore = casino.treasury(address(usdc));
+        uint256 lockedBefore = casino.locked(address(usdc));
+        uint256 deadline = block.timestamp + 1 hours;
 
-        vm.expectEmit(true, false, false, true);
-        emit GameStatusUpdated(gameId, CashCow.GameStatus.Won);
+        // Reveal seed must match the default "test_seed"
+        bytes memory signature = signCashout("test_seed", gameId, PAYOUT_AMOUNT, address(usdc), player1, deadline);
 
-        vm.expectEmit(true, false, false, true);
-        emit PayoutSent(gameId, PAYOUT_AMOUNT, address(usdc), player1);
+        vm.expectEmit(true, true, true, true);
+        emit GameWon(gameId, player1, PAYOUT_AMOUNT, address(usdc));
 
-        vm.prank(owner);
-        casino.cashOut(gameId, PAYOUT_AMOUNT, "final_seed", block.timestamp + 1, "");
+        // Anyone can trigger cashout with valid signature
+        vm.prank(player2);
+        casino.cashOut(gameId, PAYOUT_AMOUNT, "test_seed", deadline, signature);
 
         // Check game state
         CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Won));
+        assertEq(uint256(game.status), uint256(CashCow.GameStatus.WON));
         assertEq(game.payoutAmount, PAYOUT_AMOUNT);
-        assertEq(game.gameSeed, "final_seed");
+        assertEq(game.gameSeed, "test_seed");
 
         // Check balances
         assertEq(usdc.balanceOf(player1), playerBalanceBefore + PAYOUT_AMOUNT);
-        assertEq(usdc.balanceOf(address(casino)), contractBalanceBefore - PAYOUT_AMOUNT);
 
-        // Check treasury was reduced by the excess payout
-        uint256 excessPayout = PAYOUT_AMOUNT - BET_AMOUNT; // 200 - 100 = 100
-        assertEq(casino.treasury(address(usdc)), treasuryBefore - excessPayout);
-    }
+        // Treasury should lose only the excess over the bet
+        uint256 excess = PAYOUT_AMOUNT - BET_AMOUNT;
+        assertEq(casino.treasury(address(usdc)), treasuryBefore - excess);
 
-    function testCashoutByPlayerWithSignature() public {
-        uint256 gameId = createGame(player1, "game1");
-        uint256 deadline = block.timestamp + 1 hours;
-
-        bytes memory signature = signCashout(gameId, PAYOUT_AMOUNT, "final_seed", deadline);
-
-        vm.prank(player1);
-        casino.cashOut(gameId, PAYOUT_AMOUNT, "final_seed", deadline, signature);
-
-        CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Won));
-        assertEq(game.payoutAmount, PAYOUT_AMOUNT);
+        // Locked funds released
+        assertEq(casino.locked(address(usdc)), lockedBefore - BET_AMOUNT);
     }
 
     function testMarkGameAsLost() public {
-        uint256 gameId = createGame(player1, "game1");
+        bytes32 gameId = keccak256("game1");
+        createGame(player1, gameId);
 
         uint256 treasuryBefore = casino.treasury(address(usdc));
+        uint256 lockedBefore = casino.locked(address(usdc));
+        uint256 deadline = block.timestamp + 1 hours;
 
-        vm.expectEmit(true, false, false, true);
-        emit GameStatusUpdated(gameId, CashCow.GameStatus.Lost);
+        bytes memory signature = signLoss("test_seed", gameId, BET_AMOUNT, address(usdc), player1, deadline);
 
-        vm.prank(owner);
-        casino.markGameAsLost(gameId, "final_seed", block.timestamp + 1, "");
+        vm.expectEmit(true, true, false, true);
+        emit GameLost(gameId, player1);
+
+        vm.prank(player2);
+        casino.markGameAsLost(gameId, "test_seed", deadline, signature);
 
         // Check game state
         CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Lost));
-        assertEq(game.gameSeed, "final_seed");
+        assertEq(uint256(game.status), uint256(CashCow.GameStatus.LOST));
+        assertEq(game.gameSeed, "test_seed");
 
-        // Check treasury increased by bet amount
+        // Treasury recovers the bet
         assertEq(casino.treasury(address(usdc)), treasuryBefore + BET_AMOUNT);
+
+        // Locked funds released
+        assertEq(casino.locked(address(usdc)), lockedBefore - BET_AMOUNT);
     }
 
-    function testTreasuryAccounting() public {
-        // Initial state
-        uint256 initialBalance = usdc.balanceOf(address(casino));
-        uint256 initialTreasury = casino.treasury(address(usdc));
+    function testMinBetEnforcement() public {
+        bytes32 gameId = keccak256("minbet_test");
+        bytes32 gameSeedHash = keccak256(bytes("test_seed"));
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 tooSmallBet = MIN_BET - 1;
 
-        // Create and win a game with payout equal to bet
-        uint256 gameId = createGame(player1, "game1");
-        uint256 payout = BET_AMOUNT;
+        bytes memory signature = signCreateGame(gameSeedHash, gameId, tooSmallBet, address(usdc), player1, deadline);
 
-        // After game creation, balance increased by bet amount
-        uint256 balanceAfterCreate = usdc.balanceOf(address(casino));
-        assertEq(balanceAfterCreate, initialBalance + BET_AMOUNT, "Balance increased by bet");
+        vm.startPrank(player1);
+        usdc.approve(address(casino), tooSmallBet);
 
-        vm.prank(owner);
-        casino.cashOut(gameId, payout, "final_seed", block.timestamp + 1, "");
+        vm.expectRevert(CashCow.InvalidBet.selector);
+        casino.createGame(gameSeedHash, gameId, tooSmallBet, address(usdc), player1, bytes32(0), signature, deadline);
+        vm.stopPrank();
+    }
 
-        uint256 balanceAfter = usdc.balanceOf(address(casino));
-        uint256 treasuryAfter = casino.treasury(address(usdc));
+    function testLiquidityView() public {
+        bytes32 gameId = keccak256("liquidity_test");
+        createGame(player1, gameId);
 
-        // Since bet = payout, final balance should equal initial balance
-        assertEq(balanceAfter, initialBalance, "Balance returned to initial");
-        // Treasury should not change when payout equals bet
-        assertEq(treasuryAfter, initialTreasury, "Treasury unchanged when payout equals bet");
+        (uint256 balance, uint256 treasuryAmt, uint256 lockedAmt) = casino.liquidity(address(usdc));
+        assertEq(balance, usdc.balanceOf(address(casino)));
+        assertEq(treasuryAmt, casino.treasury(address(usdc)));
+        assertEq(lockedAmt, casino.locked(address(usdc)));
+        assertEq(lockedAmt, BET_AMOUNT);
     }
 
     // ========== ERROR CASES ==========
 
     function testCannotCreateDuplicateGame() public {
-        createGame(player1, "game1");
+        bytes32 gameId = keccak256("duplicate_test");
+        createGame(player1, gameId);
 
-        bytes32 gameSeedHash = keccak256("test_seed");
+        bytes32 gameSeedHash = keccak256(bytes("test_seed"));
         uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature =
-            signCreateGame("game1", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
+        bytes memory signature = signCreateGame(gameSeedHash, gameId, BET_AMOUNT, address(usdc), player1, deadline);
 
         vm.startPrank(player1);
         usdc.approve(address(casino), BET_AMOUNT);
 
         vm.expectRevert(CashCow.GameAlreadyExists.selector);
-        casino.createGame("game1", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
+        casino.createGame(gameSeedHash, gameId, BET_AMOUNT, address(usdc), player1, bytes32(0), signature, deadline);
         vm.stopPrank();
     }
 
     function testCannotCashoutTwice() public {
-        uint256 gameId = createGame(player1, "game1");
+        bytes32 gameId = keccak256("double_cashout");
+        createGame(player1, gameId);
 
-        vm.prank(owner);
-        casino.cashOut(gameId, PAYOUT_AMOUNT, "final_seed", block.timestamp + 1, "");
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory signature = signCashout("test_seed", gameId, PAYOUT_AMOUNT, address(usdc), player1, deadline);
 
-        vm.prank(owner);
+        vm.prank(player1);
+        casino.cashOut(gameId, PAYOUT_AMOUNT, "test_seed", deadline, signature);
+
+        // Second attempt must revert
+        CashCow.Game memory g = casino.getGameDetails(gameId);
+        bytes memory sig2 = signCashout(g.gameSeed, gameId, PAYOUT_AMOUNT, address(usdc), player1, deadline);
+
+        vm.prank(player1);
         vm.expectRevert(CashCow.GameNotActive.selector);
-        casino.cashOut(gameId, PAYOUT_AMOUNT, "final_seed2", block.timestamp + 1, "");
+        casino.cashOut(gameId, PAYOUT_AMOUNT, g.gameSeed, deadline, sig2);
     }
 
-    function testInsufficientTreasuryForGame() public {
-        // Remove most treasury
-        vm.prank(owner);
-        casino.removeFromTreasury(INITIAL_TREASURY - 50e6, address(usdc), owner);
+    /// @notice expires in cashOut
+    function testCashOutExpiredSignature() public {
+        bytes32 gameId = keccak256("expired_cashout");
+        createGame(player1, gameId);
 
-        bytes32 gameSeedHash = keccak256("test_seed");
+        uint256 deadline = block.timestamp - 1; // already expired
+        bytes memory signature = signCashout("test_seed", gameId, PAYOUT_AMOUNT, address(usdc), player1, deadline);
+
+        vm.prank(player1);
+        vm.expectRevert(CashCow.SignatureExpired.selector);
+        casino.cashOut(gameId, PAYOUT_AMOUNT, "test_seed", deadline, signature);
+    }
+
+    /// @notice expires in markGameAsLost
+    function testMarkGameAsLostExpiredSignature() public {
+        bytes32 gameId = keccak256("expired_loss");
+        createGame(player1, gameId);
+
+        uint256 deadline = block.timestamp - 1; // already expired
+        bytes memory signature = signLoss("test_seed", gameId, BET_AMOUNT, address(usdc), player1, deadline);
+
+        vm.prank(player1);
+        vm.expectRevert(CashCow.SignatureExpired.selector);
+        casino.markGameAsLost(gameId, "test_seed", deadline, signature);
+    }
+
+    /// @notice wrong‐seed path in markGameAsLost
+    function testMarkGameAsLostInvalidSeedReverts() public {
+        bytes32 gameId = keccak256("invalid_seed_loss");
+        createGame(player1, gameId);
+
         uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature =
-            signCreateGame("game1", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
+        // using a bad seed will hit the InvalidSeed check
+        bytes memory signature = signLoss("wrong_seed", gameId, BET_AMOUNT, address(usdc), player1, deadline);
 
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
+        vm.prank(player1);
+        vm.expectRevert(CashCow.InvalidSeed.selector);
+        casino.markGameAsLost(gameId, "wrong_seed", deadline, signature);
+    }
 
-        vm.expectRevert(CashCow.InsufficientFunds.selector);
-        casino.createGame("game1", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
+    /// @notice calling markGameAsLost twice → GameNotActive
+    function testMarkGameAsLostNonActiveReverts() public {
+        bytes32 gameId = keccak256("non_active_loss");
+        createGame(player1, gameId);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory signature = signLoss("test_seed", gameId, BET_AMOUNT, address(usdc), player1, deadline);
+
+        // first mark as lost
+        vm.prank(player2);
+        casino.markGameAsLost(gameId, "test_seed", deadline, signature);
+
+        // second attempt should revert GameNotActive
+        vm.prank(player2);
+        vm.expectRevert(CashCow.GameNotActive.selector);
+        casino.markGameAsLost(gameId, "test_seed", deadline, signature);
+    }
+
+    function testInvalidSeed() public {
+        bytes32 gameId = keccak256("seed_test");
+        createGame(player1, gameId);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory signature = signCashout("wrong_seed", gameId, PAYOUT_AMOUNT, address(usdc), player1, deadline);
+
+        vm.expectRevert(CashCow.InvalidSeed.selector);
+        vm.prank(player1);
+        casino.cashOut(gameId, PAYOUT_AMOUNT, "wrong_seed", deadline, signature);
     }
 
     function testExpiredSignature() public {
-        bytes32 gameSeedHash = keccak256("test_seed");
-        uint256 deadline = block.timestamp - 1; // Expired
-        bytes memory signature =
-            signCreateGame("game1", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
+        bytes32 gameId = keccak256("expired_test");
+        bytes32 gameSeedHash = keccak256(bytes("test_seed"));
+        uint256 deadline = block.timestamp - 1; // already expired
+        bytes memory signature = signCreateGame(gameSeedHash, gameId, BET_AMOUNT, address(usdc), player1, deadline);
 
         vm.startPrank(player1);
         usdc.approve(address(casino), BET_AMOUNT);
-
-        vm.expectRevert(CashCow.Expired.selector);
-        casino.createGame("game1", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
-    }
-
-    function testCashoutInsufficientTreasury() public {
-        // First, deplete most of the treasury
-        vm.startPrank(owner);
-        casino.removeFromTreasury(usdc.balanceOf(address(casino)), address(usdc), owner);
-        usdc.approve(address(casino), BET_AMOUNT + 1);
-        casino.addToTreasury(BET_AMOUNT + 1, address(usdc));
-        vm.stopPrank();
-
-        assertEq(usdc.balanceOf(address(casino)), BET_AMOUNT + 1, "Invalid balance");
-
-        uint256 gameId = createGame(player1, "game1");
-
-        // Try to cash out anything > bet x 2 + 1
-        uint256 excessivePayout = BET_AMOUNT * 2 + 2;
-
-        vm.startPrank(owner);
-        vm.expectRevert(CashCow.InsufficientTreasuryFunds.selector);
-        casino.cashOut(gameId, excessivePayout, "final_seed", block.timestamp + 1, "");
-        vm.stopPrank();
-
-        // But should work with exactly bet + treasury
-        uint256 maxPayout = BET_AMOUNT * 2 + 1;
-        vm.prank(owner);
-        casino.cashOut(gameId, maxPayout, "final_seed", block.timestamp + 1, "");
-
-        assertEq(casino.treasury(address(usdc)), 0, "Treasury should be zero");
-    }
-
-    function testInvalidSignature() public {
-        bytes32 gameSeedHash = keccak256("test_seed");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = "invalid_signature";
-
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
-
-        vm.expectRevert(CashCow.InvalidServerSignature.selector);
-        casino.createGame("game1", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
+        vm.expectRevert(CashCow.SignatureExpired.selector);
+        casino.createGame(gameSeedHash, gameId, BET_AMOUNT, address(usdc), player1, bytes32(0), signature, deadline);
         vm.stopPrank();
     }
 
@@ -347,707 +377,286 @@ contract CashCowTest is Test {
         casino.removeFromTreasury(1000e6, address(usdc), player1);
     }
 
-    function testPlayerCannotCashoutOthersGame() public {
-        uint256 gameId = createGame(player1, "game1");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signCashout(gameId, PAYOUT_AMOUNT, "final_seed", deadline);
+    function testOnlyOwnerCanUpdateMinBet() public {
+        vm.prank(player1);
+        vm.expectRevert(); // Ownable: caller is not the owner
+        casino.updateMinBet(address(usdc), 50e6);
+    }
 
+    function testTreasuryWithdrawalRespectingLockedFunds() public {
+        bytes32 gameId = keccak256("lock_test");
+        createGame(player1, gameId);
+
+        uint256 treasuryAmt = casino.treasury(address(usdc));
+        uint256 lockedAmt = casino.locked(address(usdc));
+        uint256 available = treasuryAmt - lockedAmt;
+
+        vm.startPrank(owner);
+        vm.expectRevert(CashCow.InsufficientTreasuryFunds.selector);
+        casino.removeFromTreasury(available + 1, address(usdc), owner);
+
+        // Withdraw exactly the available portion
+        casino.removeFromTreasury(available, address(usdc), owner);
+        vm.stopPrank();
+
+        assertEq(casino.treasury(address(usdc)), lockedAmt);
+    }
+
+    // ========== INTEGRATION TEST ==========
+
+    function testFullGameLifecycleWithLocking() public {
+        uint256 initialTreasury = casino.treasury(address(usdc));
+
+        bytes32 game1 = keccak256("game1");
+        bytes32 game2 = keccak256("game2");
+        bytes32 game3 = keccak256("game3");
+
+        createGame(player1, game1);
+        createGame(player2, game2);
+        createGame(player1, game3);
+
+        // All three locked
+        assertEq(casino.locked(address(usdc)), BET_AMOUNT * 3);
+
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // 1: player1 wins
+        bytes memory sig1 = signCashout("test_seed", game1, 150e6, address(usdc), player1, deadline);
         vm.prank(player2);
-        vm.expectRevert(CashCow.NotGamePlayer.selector);
-        casino.cashOut(gameId, PAYOUT_AMOUNT, "final_seed", deadline, signature);
+        casino.cashOut(game1, 150e6, "test_seed", deadline, sig1);
+
+        assertEq(casino.locked(address(usdc)), BET_AMOUNT * 2);
+        assertEq(casino.treasury(address(usdc)), initialTreasury - 50e6);
+
+        // 2: player2 loses
+        bytes memory sig2 = signLoss("test_seed", game2, BET_AMOUNT, address(usdc), player2, deadline);
+        vm.prank(player1);
+        casino.markGameAsLost(game2, "test_seed", deadline, sig2);
+
+        assertEq(casino.locked(address(usdc)), BET_AMOUNT);
+        assertEq(casino.treasury(address(usdc)), initialTreasury - 50e6 + BET_AMOUNT);
+
+        // 3: player1 wins exactly bet
+        bytes memory sig3 = signCashout("test_seed", game3, BET_AMOUNT, address(usdc), player1, deadline);
+        vm.prank(player2);
+        casino.cashOut(game3, BET_AMOUNT, "test_seed", deadline, sig3);
+
+        assertEq(casino.locked(address(usdc)), 0);
+        // No further treasury change
+        assertEq(casino.treasury(address(usdc)), initialTreasury - 50e6 + BET_AMOUNT);
     }
 
     // ========== EDGE CASES ==========
 
     function testGetNonExistentGame() public {
+        bytes32 nonExist = keccak256("non_existent");
         vm.expectRevert(CashCow.GameDoesNotExist.selector);
-        casino.getGameDetails(999);
+        casino.getGameDetails(nonExist);
     }
 
     function testZeroPayoutReverts() public {
-        uint256 gameId = createGame(player1, "game1");
+        bytes32 gameId = keccak256("zero_payout");
+        createGame(player1, gameId);
 
-        vm.prank(owner);
-        vm.expectRevert();
-        casino.cashOut(gameId, 0, "final_seed", block.timestamp + 1, "");
-    }
-
-    // ========== INTEGRATION TEST ==========
-
-    function testFullGameLifecycle() public {
-        uint256 initialTreasury = casino.treasury(address(usdc));
-
-        // Test multiple games with wins and losses
-        uint256 game1 = createGame(player1, "game1");
-        uint256 game2 = createGame(player2, "game2");
-        uint256 game3 = createGame(player1, "game3");
-
-        // Player 1 wins game 1 with payout > bet
-        vm.prank(owner);
-        casino.cashOut(game1, 150e6, "seed1", block.timestamp + 1, "");
-
-        // Treasury should decrease by 50 (payout 150 - bet 100)
-        assertEq(casino.treasury(address(usdc)), initialTreasury - 50e6);
-
-        // Player 2 loses game 2
-        vm.prank(owner);
-        casino.markGameAsLost(game2, "seed2", block.timestamp + 1, "");
-
-        // Treasury should increase by bet amount
-        assertEq(casino.treasury(address(usdc)), initialTreasury - 50e6 + BET_AMOUNT);
-
-        // Player 1 loses game 3
-        vm.prank(owner);
-        casino.markGameAsLost(game3, "seed3", block.timestamp + 1, "");
-
-        // Final treasury should be initial - 50 + 100 + 100 = initial + 150
-        assertEq(casino.treasury(address(usdc)), initialTreasury + 150e6);
-
-        // Verify final states
-        CashCow.Game memory g1 = casino.getGameDetails(game1);
-        CashCow.Game memory g2 = casino.getGameDetails(game2);
-        CashCow.Game memory g3 = casino.getGameDetails(game3);
-
-        assertEq(uint256(g1.status), uint256(CashCow.GameStatus.Won));
-        assertEq(uint256(g2.status), uint256(CashCow.GameStatus.Lost));
-        assertEq(uint256(g3.status), uint256(CashCow.GameStatus.Lost));
-
-        assertEq(g1.payoutAmount, 150e6);
-        assertEq(g2.payoutAmount, 0);
-        assertEq(g3.payoutAmount, 0);
-    }
-
-    // ========== OVERFLOW/UNDERFLOW TESTS ==========
-
-    function testNoOverflowOnLargeBets() public {
-        // Test with maximum uint256 values
-        bytes32 gameSeedHash = keccak256("overflow_test");
         uint256 deadline = block.timestamp + 1 hours;
-        uint256 largeBet = type(uint256).max / 2;
+        bytes memory signature = signCashout("final_seed", gameId, 0, address(usdc), player1, deadline);
 
-        bytes memory signature =
-            signCreateGame("overflow_game", gameSeedHash, "v1", attacker, largeBet, address(usdc), deadline);
-
-        vm.startPrank(attacker);
-        usdc.approve(address(casino), largeBet);
-
-        // Should fail due to insufficient balance
-        vm.expectRevert();
-        casino.createGame("overflow_game", gameSeedHash, "v1", largeBet, address(usdc), deadline, signature);
-        vm.stopPrank();
+        vm.expectRevert(CashCow.InvalidPayout.selector);
+        vm.prank(player1);
+        casino.cashOut(gameId, 0, "final_seed", deadline, signature);
     }
 
-    function testTreasuryArithmeticSafety() public {
-        // Try to cause underflow
-        vm.prank(owner);
-        vm.expectRevert(CashCow.InsufficientTreasuryFunds.selector);
-        casino.removeFromTreasury(INITIAL_TREASURY + 1, address(usdc), attacker);
+    function testPayoutLessThanBet() public {
+        bytes32 gameId = keccak256("small_payout");
+        createGame(player1, gameId);
 
-        // Verify treasury didn't change
-        assertEq(casino.treasury(address(usdc)), INITIAL_TREASURY);
-    }
-
-    // ========== SIGNATURE MANIPULATION TESTS ==========
-
-    function testSignatureMalleability() public {
-        bytes32 gameSeedHash = keccak256("malleability_test");
+        uint256 smallPayout = BET_AMOUNT / 2;
         uint256 deadline = block.timestamp + 1 hours;
+        uint256 treasuryBefore = casino.treasury(address(usdc));
 
-        // Get valid signature
-        bytes memory signature =
-            signCreateGame("sig_test", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-
-        // Try to manipulate v value (should fail)
-        bytes memory malleatedSig = signature;
-        uint8 v = uint8(malleatedSig[64]);
-        if (v == 27) {
-            malleatedSig[64] = bytes1(uint8(28));
-        } else {
-            malleatedSig[64] = bytes1(uint8(27));
-        }
-
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
-        vm.expectRevert(CashCow.InvalidServerSignature.selector);
-        casino.createGame("sig_test", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, malleatedSig);
-        vm.stopPrank();
-    }
-
-    function testReplayAttackPrevention() public {
-        // Create a game with a specific deadline
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes32 gameSeedHash = keccak256("replay_test");
-        bytes memory signature =
-            signCreateGame("replay_game", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-
-        // First use succeeds
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT * 2);
-        casino.createGame("replay_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-
-        // Try to replay with different gameId but same signature (should fail due to game already exists)
-        vm.expectRevert(CashCow.GameAlreadyExists.selector);
-        casino.createGame("replay_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
-    }
-
-    // ========== FRONT-RUNNING TESTS ==========
-
-    function testFrontRunningProtection() public {
-        // Player1 prepares to create a game
-        bytes32 gameSeedHash = keccak256("frontrun_test");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature =
-            signCreateGame("frontrun_game", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-
-        // Attacker tries to front-run with the same signature
-        vm.startPrank(attacker);
-        usdc.approve(address(casino), BET_AMOUNT);
-        vm.expectRevert(CashCow.InvalidServerSignature.selector);
-        casino.createGame("frontrun_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
-
-        // Original transaction still works
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
-        casino.createGame("frontrun_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
-    }
-
-    // ========== GAS GRIEFING TESTS ==========
-
-    function testGasGriefingProtection() public {
-        // Create many small games to test gas limits
-        for (uint256 i = 0; i < 10; i++) {
-            createGame(player1, string(abi.encodePacked("gas_test_", vm.toString(i))));
-        }
-
-        // All games should be created successfully
-        assertEq(casino.gameCounter(), 10);
-    }
-
-    // ========== EDGE CASE: ZERO VALUES ==========
-
-    function testZeroValueEdgeCases() public {
-        // Test adding zero to treasury
-        vm.startPrank(owner);
-        usdc.approve(address(casino), 0);
-        casino.addToTreasury(0, address(usdc));
-        vm.stopPrank();
-
-        // Test removing zero from treasury
-        vm.prank(owner);
-        casino.removeFromTreasury(0, address(usdc), player1);
-
-        // Both should succeed without issues
-        assertTrue(true);
-    }
-
-    // ----------------------------------------------------------------
-    // Test: markGameAsLost by player with valid signature
-    // ----------------------------------------------------------------
-    function testMarkGameAsLostByPlayerWithSignature() public {
-        uint256 gameId = createGame(player1, "gameLoss1");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signLoss(gameId, "final_seed", deadline);
+        bytes memory signature = signCashout("test_seed", gameId, smallPayout, address(usdc), player1, deadline);
 
         vm.prank(player1);
-        casino.markGameAsLost(gameId, "final_seed", deadline, signature);
+        casino.cashOut(gameId, smallPayout, "test_seed", deadline, signature);
 
-        CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Lost));
-        assertEq(game.gameSeed, "final_seed");
+        // Because payout < bet, treasury stays the same
+        assertEq(casino.treasury(address(usdc)), treasuryBefore);
     }
 
-    // ----------------------------------------------------------------
-    // Test: unauthorized caller cannot mark game as lost
-    // ----------------------------------------------------------------
-    function testUnauthorizedMarkGameAsLost() public {
-        uint256 gameId = createGame(player1, "gameLoss2");
+    function testVerifyFunction() public {
+        string memory seed = "test_seed";
+        bytes32 correctHash = keccak256(bytes(seed));
+        bytes32 incorrectHash = keccak256(bytes("wrong_seed"));
+
+        assertTrue(casino.verify(seed, correctHash));
+        assertFalse(casino.verify(seed, incorrectHash));
+    }
+
+    // ========== NEGATIVE CREATE GAME BRANCHES ==========
+
+    function testCreateGameZeroBetReverts() public {
+        bytes32 gameId = keccak256("zero_bet");
+        bytes32 seedHash = keccak256(bytes("test_seed"));
         uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signLoss(gameId, "final_seed", deadline);
+        bytes memory badSig = signCreateGame(seedHash, gameId, 0, address(usdc), player1, deadline);
+
+        vm.startPrank(player1);
+        usdc.approve(address(casino), 0);
+        vm.expectRevert(CashCow.InvalidBet.selector);
+        casino.createGame(seedHash, gameId, 0, address(usdc), player1, bytes32(0), badSig, deadline);
+        vm.stopPrank();
+    }
+
+    function testCreateGameInvalidSignatureReverts() public {
+        bytes32 gameId = keccak256("bad_sig");
+        bytes32 seedHash = keccak256(bytes("test_seed"));
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory junk = new bytes(65);
+
+        vm.startPrank(player1);
+        usdc.approve(address(casino), BET_AMOUNT);
+        vm.expectRevert(CashCow.InvalidServerSignature.selector);
+        casino.createGame(seedHash, gameId, BET_AMOUNT, address(usdc), player1, bytes32(0), junk, deadline);
+        vm.stopPrank();
+    }
+
+    // ========== CASHOUT BRANCHES ==========
+
+    function testCashOutNonexistentReverts() public {
+        bytes32 gameId = keccak256("no_game");
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory junk = new bytes(65);
+
+        vm.prank(player1);
+        vm.expectRevert(CashCow.GameDoesNotExist.selector);
+        casino.cashOut(gameId, PAYOUT_AMOUNT, "test_seed", deadline, junk);
+    }
+
+    function testCashOutInvalidSignatureReverts() public {
+        bytes32 gameId = keccak256("game1");
+        createGame(player1, gameId);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory junk = new bytes(65);
+
+        vm.prank(player1);
+        vm.expectRevert(CashCow.InvalidServerSignature.selector);
+        casino.cashOut(gameId, PAYOUT_AMOUNT, "test_seed", deadline, junk);
+    }
+
+    function testCashOutInsufficientTreasuryFundsReverts() public {
+        // 1) Set up a new game and lock up the bet
+        bytes32 gameId = keccak256("game1");
+        createGame(player1, gameId);
+
+        // 2) Drain only the AVAILABLE treasury (treasury - locked)
+        uint256 available = casino.treasury(address(usdc)) - casino.locked(address(usdc));
+        vm.startPrank(owner);
+        casino.removeFromTreasury(available, address(usdc), owner);
+        vm.stopPrank();
+        // now: treasury == locked == BET_AMOUNT
+
+        // 3) Try to cash out so that excess payout > treasury
+        uint256 deadline = block.timestamp + 1 hours;
+        // bigPayout such that (bigPayout - BET_AMOUNT) > treasury
+        uint256 bigPayout = BET_AMOUNT + casino.treasury(address(usdc)) + 1;
+
+        bytes memory signature = signCashout("test_seed", gameId, bigPayout, address(usdc), player1, deadline);
+
+        // 4) Expect the INSufficientTreasuryFunds revert inside cashOut
+        vm.prank(player1);
+        vm.expectRevert(CashCow.InsufficientTreasuryFunds.selector);
+        casino.cashOut(gameId, bigPayout, "test_seed", deadline, signature);
+    }
+
+    // ========== MARK AS LOST BRANCHES ==========
+
+    function testMarkGameAsLostNonexistentReverts() public {
+        bytes32 gameId = keccak256("no_game");
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory junk = new bytes(65);
+
+        vm.prank(player1);
+        vm.expectRevert(CashCow.GameDoesNotExist.selector);
+        casino.markGameAsLost(gameId, "test_seed", deadline, junk);
+    }
+
+    function testMarkGameAsLostInvalidSignatureReverts() public {
+        bytes32 gameId = keccak256("game1");
+        createGame(player1, gameId);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory junk = new bytes(65);
 
         vm.prank(player2);
-        vm.expectRevert(CashCow.NotGamePlayer.selector);
-        casino.markGameAsLost(gameId, "final_seed", deadline, signature);
-    }
-
-    // ----------------------------------------------------------------
-    // Test: getOnChainGameId returns zero for nonexistent preliminary ID
-    // ----------------------------------------------------------------
-    function testGetOnChainGameIdZero() public {
-        uint256 id = casino.getOnChainGameId("nonexistent");
-        assertEq(id, 0);
-    }
-
-    // ----------------------------------------------------------------
-    // Test: balance() view before and after payout
-    // ----------------------------------------------------------------
-    function testBalanceViewBeforeAndAfterPayout() public {
-        // Calculate initial free balance (excluding treasury)
-        uint256 initialFree = usdc.balanceOf(address(casino)) - casino.treasury(address(usdc));
-
-        // Create a game and verify free balance increases by the bet
-        uint256 gameId = createGame(player1, "gameBalance");
-        uint256 afterCreate = casino.balance(address(usdc));
-        assertEq(afterCreate, initialFree + BET_AMOUNT, "Balance should increase by bet");
-
-        // Cash out full bet and verify free balance returns to initial
-        vm.prank(owner);
-        casino.cashOut(gameId, BET_AMOUNT, "seedB", block.timestamp + 1, "");
-
-        uint256 afterPayout = casino.balance(address(usdc));
-        assertEq(afterPayout, initialFree, "Balance should return to initial after payout");
-    }
-
-    // ----------------------------------------------------------------
-    // Test: double-loss protection (cannot mark same game lost twice)
-    // ----------------------------------------------------------------
-    function testDoubleLossProtection() public {
-        uint256 gameId = createGame(player1, "gameLoss3");
-
-        // First loss succeeds
-        vm.prank(owner);
-        casino.markGameAsLost(gameId, "seedL", block.timestamp + 1, "");
-
-        // Second loss should revert with GameNotActive
-        vm.prank(owner);
-        vm.expectRevert(CashCow.GameNotActive.selector);
-        casino.markGameAsLost(gameId, "seedL2", block.timestamp + 1, "");
-    }
-
-    // ----------------------------------------------------------------
-    // Test: cashout where payout > bet, treasury has enough funds
-    // ----------------------------------------------------------------
-    function testCashoutPayoutAboveBetTreasuryCover() public {
-        // Create game and capture initial treasury
-        uint256 gameId = createGame(player1, "gameExtra1");
-        uint256 initialTreasury = casino.treasury(address(usdc));
-
-        uint256 extra = 50e6;
-        uint256 payout = BET_AMOUNT + extra;
-
-        // Owner performs cashOut
-        vm.prank(owner);
-        casino.cashOut(gameId, payout, "seedExtra", block.timestamp + 1, "");
-
-        // Treasury should decrease by the extra amount
-        uint256 afterTreasury = casino.treasury(address(usdc));
-        assertEq(afterTreasury, initialTreasury - extra, "Treasury should decrease by paidFromTreasury");
-
-        // Player receives full payout
-        uint256 playerBalance = usdc.balanceOf(player1);
-        assertEq(playerBalance, 1000e6 - BET_AMOUNT + payout, "Player should receive full payout");
-    }
-
-    // ----------------------------------------------------------------
-    // Test: cashout where payout > bet, treasury insufficient
-    // ----------------------------------------------------------------
-    function testCashoutPayoutAboveBetTreasuryInsufficient() public {
-        uint256 gameId = createGame(player1, "gameExtra2");
-
-        // Remove all treasury funds
-        uint256 treasuryAmt = casino.treasury(address(usdc));
-        vm.prank(owner);
-        casino.removeFromTreasury(treasuryAmt, address(usdc), owner);
-
-        uint256 payout = BET_AMOUNT + 1;
-
-        // Owner cashOut should revert due to insufficient treasury
-        vm.prank(owner);
-        vm.expectRevert(CashCow.InsufficientTreasuryFunds.selector);
-        casino.cashOut(gameId, payout, "seedFail", block.timestamp + 1, "");
-    }
-
-    // Test _msgData() function through meta-transaction
-    function testMsgDataFunction() public {
-        // Create a meta-transaction context by calling from trusted forwarder
-        vm.startPrank(trustedForwarder);
-
-        // The _msgData() function is called internally when checking context
-        // We need to trigger it through a function that uses _msgSender()
-
-        // First, let's create a game through the trusted forwarder
-        bytes32 gameSeedHash = keccak256("meta_tx_test");
-        uint256 deadline = block.timestamp + 1 hours;
-
-        // Encode the actual sender at the end of the calldata (ERC2771 pattern)
-        bytes memory signature =
-            signCreateGame("meta_game", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-
-        // Prepare calldata with appended sender
-        bytes memory callData = abi.encodeWithSelector(
-            casino.createGame.selector, "meta_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature
-        );
-
-        // Append the actual sender (player1) to the calldata
-        bytes memory metaTxData = abi.encodePacked(callData, player1);
-
-        // Give player1 approval through separate tx
-        vm.stopPrank();
-        vm.prank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
-
-        // Execute meta-transaction
-        vm.prank(trustedForwarder);
-        (bool success,) = address(casino).call(metaTxData);
-        assertTrue(success, "Meta-transaction should succeed");
-
-        // Verify game was created with player1 as the player
-        CashCow.Game memory game = casino.getGameDetails(casino.gameCounter());
-        assertEq(game.player, player1, "Game should be created for player1");
-
-        vm.stopPrank();
-    }
-
-    // Test _contextSuffixLength() through meta-transaction
-    function testContextSuffixLength() public {
-        // This function returns 20 when called by trusted forwarder, 0 otherwise
-
-        // Test 1: Call from non-trusted forwarder (should use regular context)
-        vm.prank(player1);
-        // Any call will internally use _contextSuffixLength
-        try casino.gameCounter() returns (uint256) {
-            // Just calling to trigger internal function
-        } catch {
-            // Should not revert
-        }
-
-        // Test 2: Call from trusted forwarder
-        vm.prank(trustedForwarder);
-        bytes memory callData = abi.encodeWithSelector(casino.gameCounter.selector);
-        bytes memory metaTxData = abi.encodePacked(callData, player1);
-
-        (bool success,) = address(casino).call(metaTxData);
-        assertTrue(success, "Call from trusted forwarder should succeed");
-    }
-
-    // Test the exact boundary where payout equals bet (no treasury deduction branch)
-    function testPayoutExactlyEqualsBet() public {
-        uint256 gameId = createGame(player1, "exact_bet_game");
-        uint256 treasuryBefore = casino.treasury(address(usdc));
-
-        // Payout exactly equals bet - should not touch treasury
-        vm.prank(owner);
-        casino.cashOut(gameId, BET_AMOUNT, "seed", block.timestamp + 1, "");
-
-        assertEq(casino.treasury(address(usdc)), treasuryBefore, "Treasury should not change");
-    }
-
-    // Test deadline exactly at block.timestamp (boundary condition)
-    function testDeadlineExactlyNow() public {
-        bytes32 gameSeedHash = keccak256("deadline_now");
-        uint256 deadline = block.timestamp; // Exactly now
-        bytes memory signature =
-            signCreateGame("deadline_now_game", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
-
-        // Should succeed when deadline = block.timestamp
-        casino.createGame("deadline_now_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
-
-        assertEq(casino.gameCounter(), 1, "Game should be created");
-    }
-
-    // Test assert(payoutAmount > 0) with exact zero
-    function testZeroPayoutAssert() public {
-        uint256 gameId = createGame(player1, "zero_payout_game");
-
-        // This should trigger the assert and cause a panic
-        vm.prank(owner);
-        vm.expectRevert(CashCow.InvalidPayout.selector);
-        casino.cashOut(gameId, 0, "seed", block.timestamp + 1, "");
-    }
-
-    // Test owner cashout without signature (different branch)
-    function testOwnerCashoutNoSignature() public {
-        uint256 gameId = createGame(player1, "owner_cashout");
-
-        // Owner can cashout without signature
-        vm.prank(owner);
-        casino.cashOut(gameId, BET_AMOUNT, "seed", block.timestamp + 1, "");
-
-        CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Won));
-    }
-
-    // Test player cashout with signature (different branch)
-    function testPlayerCashoutWithSignature() public {
-        uint256 gameId = createGame(player1, "player_cashout");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signCashout(gameId, BET_AMOUNT, "seed", deadline);
-
-        // Player needs signature
-        vm.prank(player1);
-        casino.cashOut(gameId, BET_AMOUNT, "seed", deadline, signature);
-
-        CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Won));
-    }
-
-    // Test markGameAsLost by owner (no signature branch)
-    function testMarkAsLostByOwner() public {
-        uint256 gameId = createGame(player1, "owner_loss");
-
-        vm.prank(owner);
-        casino.markGameAsLost(gameId, "loss_seed", block.timestamp + 1, "");
-
-        CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Lost));
-    }
-
-    // Test markGameAsLost by player (signature branch)
-    function testMarkAsLostByPlayer() public {
-        uint256 gameId = createGame(player1, "player_loss");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signLoss(gameId, "loss_seed", deadline);
-
-        vm.prank(player1);
-        casino.markGameAsLost(gameId, "loss_seed", deadline, signature);
-
-        CashCow.Game memory game = casino.getGameDetails(gameId);
-        assertEq(uint256(game.status), uint256(CashCow.GameStatus.Lost));
-    }
-
-    // ========== MISSING LINE COVERAGE ==========
-
-    // Test all error conditions to ensure all revert statements are hit
-    function testAllErrorPaths() public {
-        // GameDoesNotExist in cashOut
-        vm.prank(owner);
-        vm.expectRevert(CashCow.GameDoesNotExist.selector);
-        casino.cashOut(999, 100e6, "seed", block.timestamp + 1, "");
-
-        // GameDoesNotExist in markGameAsLost
-        vm.prank(owner);
-        vm.expectRevert(CashCow.GameDoesNotExist.selector);
-        casino.markGameAsLost(999, "seed", block.timestamp + 1, "");
-
-        // Not authorized in cashOut (non-owner, non-player)
-        uint256 gameId = createGame(player1, "auth_test");
-        address randomUser = makeAddr("random");
-
-        vm.prank(randomUser);
-        vm.expectRevert(CashCow.NotGamePlayer.selector);
-        casino.cashOut(gameId, BET_AMOUNT, "seed", block.timestamp + 1, "");
-
-        // Not authorized in markGameAsLost
-        vm.prank(randomUser);
-        vm.expectRevert(CashCow.NotGamePlayer.selector);
-        casino.markGameAsLost(gameId, "seed", block.timestamp + 1, "");
-    }
-
-    // Test signature verification with invalid signer
-    function testInvalidSignerBranch() public {
-        // Create signature with wrong private key
-        uint256 wrongKey = 0xBAD;
-        bytes32 gameSeedHash = keccak256("wrong_signer");
-        uint256 deadline = block.timestamp + 1 hours;
-
-        bytes32 structHash =
-            casino.hashCreateGame("wrong_sig_game", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-        bytes32 digest = MessageHashUtils.toTypedDataHash(casino.domainSeparator(), structHash);
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, digest);
-        bytes memory wrongSignature = abi.encodePacked(r, s, v);
-
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
         vm.expectRevert(CashCow.InvalidServerSignature.selector);
-        casino.createGame("wrong_sig_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, wrongSignature);
-        vm.stopPrank();
+        casino.markGameAsLost(gameId, "test_seed", deadline, junk);
     }
 
-    // Test treasury deduction edge case where payout is just slightly more than bet
-    function testTreasuryDeductionBranch() public {
-        uint256 gameId = createGame(player1, "treasury_branch");
-        uint256 treasuryBefore = casino.treasury(address(usdc));
+    // ========== EXPIRE GAME BRANCHES ==========
 
-        // Payout is 1 wei more than bet - should deduct from treasury
-        uint256 payout = BET_AMOUNT + 1;
+    function testExpireGameTooEarlyReverts() public {
+        bytes32 gameId = keccak256("to_soon");
+        createGame(player1, gameId);
 
-        vm.prank(owner);
-        casino.cashOut(gameId, payout, "seed", block.timestamp + 1, "");
-
-        assertEq(casino.treasury(address(usdc)), treasuryBefore - 1, "Treasury should decrease by 1");
+        vm.expectRevert(CashCow.GameStillActive.selector);
+        casino.expireGame(gameId);
     }
 
-    // Test the _isOwner internal function through different paths
-    function testOwnerCheckPaths() public {
-        uint256 gameId = createGame(player1, "owner_check");
+    function testExpireGameSuccess() public {
+        bytes32 gameId = keccak256("will_expire");
+        createGame(player1, gameId);
 
-        // Path 1: Owner calling without signature
-        vm.prank(owner);
-        casino.cashOut(gameId, 50e6, "seed1", block.timestamp + 1, "");
+        // fast‑forward past 6 hours
+        vm.warp(block.timestamp + casino.GAME_EXPIRY() + 1);
 
-        // Reset game for next test
-        gameId = createGame(player1, "owner_check2");
+        vm.expectEmit(true, true, false, true);
+        emit GameExpired(gameId, player1);
+        casino.expireGame(gameId);
 
-        // Path 2: Non-owner (player) needs signature
+        CashCow.Game memory g = casino.getGameDetails(gameId);
+        assertEq(uint256(g.status), uint256(CashCow.GameStatus.EXPIRED));
+        // locked released, treasury recovers the bet
+        assertEq(casino.locked(address(usdc)), 0);
+        assertEq(casino.treasury(address(usdc)), INITIAL_TREASURY + BET_AMOUNT);
+    }
+
+    function testExpireGameNonActiveReverts() public {
+        bytes32 gameId = keccak256("already_resolved");
+        createGame(player1, gameId);
+
+        // resolve it
         uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signCashout(gameId, 50e6, "seed2", deadline);
+        bytes memory sig = signCashout("test_seed", gameId, BET_AMOUNT, address(usdc), player1, deadline);
+        vm.prank(player2);
+        casino.cashOut(gameId, BET_AMOUNT, "test_seed", deadline, sig);
 
-        vm.prank(player1);
-        casino.cashOut(gameId, 50e6, "seed2", deadline, signature);
+        vm.expectRevert(CashCow.GameNotActive.selector);
+        casino.expireGame(gameId);
     }
 
-    // Test supportsInterface with unsupported interface
-    function testSupportsInterfaceUnsupported() public {
-        // Test with a random interface ID that's not supported
-        bytes4 unsupportedInterface = 0x12345678;
-        assertFalse(casino.supportsInterface(unsupportedInterface), "Should not support random interface");
+    // ========== ADMIN FUNCTIONS ==========
 
-        // Test with ERC721 interface (not supported)
-        bytes4 erc721Interface = 0x80ac58cd;
-        assertFalse(casino.supportsInterface(erc721Interface), "Should not support ERC721 interface");
-    }
+    function testUpdateMinBetAsOwner() public {
+        address token = address(usdc);
+        uint256 newBet = 50e6;
 
-    // Test _msgSender from non-trusted forwarder to ensure both branches are covered
-    function testMsgSenderNonTrustedForwarder() public {
-        // When called from a regular address (not trusted forwarder),
-        // _msgSender should return the actual caller
-        vm.prank(player1);
-
-        // Create a game to trigger _msgSender() internally
-        bytes32 gameSeedHash = keccak256("non_trusted_test");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature =
-            signCreateGame("non_trusted_game", gameSeedHash, "v1", player1, BET_AMOUNT, address(usdc), deadline);
-
-        vm.startPrank(player1);
-        usdc.approve(address(casino), BET_AMOUNT);
-        casino.createGame("non_trusted_game", gameSeedHash, "v1", BET_AMOUNT, address(usdc), deadline, signature);
-        vm.stopPrank();
-
-        // Verify the game was created with player1 as the player
-        CashCow.Game memory game = casino.getGameDetails(casino.gameCounter());
-        assertEq(game.player, player1, "Should use regular msg.sender when not from trusted forwarder");
-    }
-
-    // Test edge case where msg.data length is exactly at the boundary
-    function testMetaTxBoundaryConditions() public {
-        vm.startPrank(trustedForwarder);
-
-        // Test with exactly minimum required data
-        bytes memory callData = abi.encodeWithSelector(casino.gameCounter.selector);
-        bytes memory minData = abi.encodePacked(callData, address(0));
-        (bool success,) = address(casino).call(minData);
-        assertTrue(success || !success, "Boundary test executed");
-
-        vm.stopPrank();
-    }
-
-    // Test _msgData() function paths
-    function testMsgDataPaths() public {
-        // Path 1: Regular call (not from trusted forwarder)
-        vm.prank(player1);
-        // This will use the regular msg.data path
-        casino.gameCounter();
-
-        // Path 2: Meta-transaction call
-        vm.prank(trustedForwarder);
-        bytes memory callData = abi.encodeWithSelector(casino.gameCounter.selector);
-        bytes memory metaTxData = abi.encodePacked(callData, player1);
-        (bool success,) = address(casino).call(metaTxData);
-        assertTrue(success, "Meta-tx should succeed");
-    }
-
-    // Test for any remaining uncovered lines in cashOut payout logic
-    function testCashoutPayoutExactBoundary() public {
-        uint256 gameId = createGame(player1, "boundary_test");
-        uint256 treasuryBefore = casino.treasury(address(usdc));
-
-        // Test when payoutAmount == game.betAmount (boundary condition)
         vm.prank(owner);
-        casino.cashOut(gameId, BET_AMOUNT, "boundary", block.timestamp + 1, "");
-
-        // Treasury should remain unchanged
-        assertEq(casino.treasury(address(usdc)), treasuryBefore, "Treasury unchanged when payout equals bet");
-
-        // Create another game for the other branch
-        gameId = createGame(player1, "boundary_test2");
-        treasuryBefore = casino.treasury(address(usdc));
-
-        // Test when payoutAmount < game.betAmount
-        uint256 smallerPayout = BET_AMOUNT - 10e6;
-        vm.prank(owner);
-        casino.cashOut(gameId, smallerPayout, "smaller", block.timestamp + 1, "");
-
-        // Treasury should still be unchanged (no deduction needed)
-        assertEq(casino.treasury(address(usdc)), treasuryBefore, "Treasury unchanged when payout less than bet");
+        vm.expectEmit(true, true, false, true);
+        emit MinBetUpdated(token, newBet);
+        casino.updateMinBet(token, newBet);
+        assertEq(casino.minBets(token), newBet);
     }
 
-    // Test all error conditions are triggered
-    function testRemainingErrorConditions() public {
-        // Ensure NullBet error is covered
-        bytes32 gameSeedHash = keccak256("null_bet_test");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signCreateGame(
-            "null_bet",
-            gameSeedHash,
-            "v1",
-            player1,
-            0, // Zero bet
-            address(usdc),
-            deadline
-        );
+    function testAddToTreasuryAsOwner() public {
+        uint256 deposit = 500e6;
+        usdc.mint(owner, deposit);
 
-        vm.startPrank(player1);
-        vm.expectRevert(CashCow.NullBet.selector);
-        casino.createGame("null_bet", gameSeedHash, "v1", 0, address(usdc), deadline, signature);
-        vm.stopPrank();
-    }
-
-    // Test view functions with edge cases
-    function testViewFunctionsEdgeCases() public {
-        // Test preliminaryToOnChainId mapping for non-existent entries
-        assertEq(casino.preliminaryToOnChainId("never_created"), 0);
-
-        // Test games mapping for id 0 (which should be empty)
-        vm.expectRevert(CashCow.GameDoesNotExist.selector);
-        casino.getGameDetails(0);
-
-        // Test treasury view for non-initialized token
-        ERC20Mock tkn = new ERC20Mock();
-        assertEq(casino.treasury(address(tkn)), 0);
-
-        // Test balance view for non-initialized token
-        assertEq(casino.balance(address(tkn)), 0);
-    }
-
-    // Comprehensive test to ensure all paths in complex functions are covered
-    function testAllPathsInComplexFunctions() public {
-        // Test createGame with all validation paths
-
-        // Path 1: Insufficient funds in treasury
         vm.startPrank(owner);
-        uint256 currentTreasury = casino.treasury(address(usdc));
-        casino.removeFromTreasury(currentTreasury - 50e6, address(usdc), owner);
+        usdc.approve(address(casino), deposit);
+        vm.expectEmit(false, false, false, true);
+        emit TreasuryDeposit(deposit, address(usdc));
+        casino.addToTreasury(deposit, address(usdc));
         vm.stopPrank();
 
-        bytes32 gameSeedHash = keccak256("insufficient_test");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature = signCreateGame(
-            "insufficient_game",
-            gameSeedHash,
-            "v1",
-            player1,
-            100e6, // Bet amount > treasury
-            address(usdc),
-            deadline
-        );
-
-        vm.startPrank(player1);
-        usdc.approve(address(casino), 100e6);
-        vm.expectRevert(CashCow.InsufficientFunds.selector);
-        casino.createGame("insufficient_game", gameSeedHash, "v1", 100e6, address(usdc), deadline, signature);
-        vm.stopPrank();
-
-        // Restore treasury
-        vm.startPrank(owner);
-        usdc.approve(address(casino), INITIAL_TREASURY);
-        casino.addToTreasury(INITIAL_TREASURY - 50e6, address(usdc));
-        vm.stopPrank();
+        assertEq(casino.treasury(address(usdc)), INITIAL_TREASURY + deposit);
     }
 }
