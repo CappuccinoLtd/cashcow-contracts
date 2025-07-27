@@ -35,7 +35,7 @@ contract CashCow is Ownable, EIP712 {
         address betToken; // Token used to place bet
         address player; // Player's wallet address
         GameStatus status; // Current game status
-        string gameSeed; // Seed used to generate the game state
+        string gameSeed; // Seed used to generate the game random result
     }
 
     /// @notice Mapping from on-chain game ID to Game data
@@ -107,7 +107,7 @@ contract CashCow is Ownable, EIP712 {
     /// @notice Not enough funds in the treasury to play
     error InsufficientFunds();
 
-    /// @notice Not enough funds in the treasury to withdraw
+    /// @notice Not enough funds in the treasury to withdraw or payout
     error InsufficientTreasuryFunds();
 
     /// @notice Signature has expired
@@ -198,12 +198,10 @@ contract CashCow is Ownable, EIP712 {
         bytes calldata serverSignature,
         uint256 deadline
     ) external checkDeadline(deadline) {
-        if (betAmount == 0 || betAmount < minBets[betToken]) revert InvalidBet();
-        if (treasury[betToken] - locked[betToken] < betAmount) revert InsufficientFunds();
-        if (games[gameId].betAmount != 0) revert GameAlreadyExists();
+        // Only the owner can create games on behalf of other users
+        address user = owner() == msg.sender ? player : msg.sender;
 
-        bytes32 messageHash = hashCreateGame(gameSeedHash, gameId, betAmount, betToken, player, deadline);
-        _verifyAnyAdminSignature(messageHash, serverSignature);
+        _validateGameCreationInputs(gameSeedHash, gameId, betAmount, betToken, user, serverSignature, deadline);
 
         games[gameId] = Game({
             gameSeed: "",
@@ -212,7 +210,7 @@ contract CashCow is Ownable, EIP712 {
             createdAt: block.timestamp,
             betAmount: betAmount,
             betToken: betToken,
-            player: player,
+            player: user,
             status: GameStatus.ACTIVE,
             extra: extra,
             payoutAmount: 0
@@ -220,9 +218,9 @@ contract CashCow is Ownable, EIP712 {
 
         locked[betToken] += betAmount;
 
-        IERC20(betToken).safeTransferFrom(msg.sender, address(this), betAmount);
+        IERC20(betToken).safeTransferFrom(user, address(this), betAmount);
 
-        emit GameCreated(gameId, player, betAmount, betToken, gameSeedHash);
+        emit GameCreated(gameId, user, betAmount, betToken, gameSeedHash);
     }
 
     function cashOut(
@@ -344,6 +342,23 @@ contract CashCow is Ownable, EIP712 {
     // ===============================
     // Internal Helper Functions
     // ===============================
+
+    function _validateGameCreationInputs(
+        bytes32 gameSeedHash,
+        bytes32 gameId,
+        uint256 betAmount,
+        address betToken,
+        address player,
+        bytes calldata serverSignature,
+        uint256 deadline
+    ) internal view {
+        if (betAmount == 0 || betAmount < minBets[betToken]) revert InvalidBet();
+        if (treasury[betToken] - locked[betToken] < betAmount) revert InsufficientFunds();
+        if (games[gameId].betAmount != 0) revert GameAlreadyExists();
+
+        bytes32 messageHash = hashCreateGame(gameSeedHash, gameId, betAmount, betToken, player, deadline);
+        _verifyAnyAdminSignature(messageHash, serverSignature);
+    }
 
     function _verifyAnyAdminSignature(bytes32 _hash, bytes calldata _signature) internal view {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), _hash));

@@ -18,8 +18,9 @@ fuzz = { runs = 1_000 }
 verbosity = 4
 
 [etherscan]
+abstract = { key = "${ETHERSCAN_KEY}" }
 arbitrum = { key = "${ETHERSCAN_KEY}" }
 base = { key = "${ETHERSCAN_KEY}" }
-
+linea = { key = "${ETHERSCAN_KEY}" }
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
