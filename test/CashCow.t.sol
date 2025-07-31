@@ -22,6 +22,7 @@ contract CashCowTest is Test {
     uint256 constant BET_AMOUNT = 100e6; // 100 USDC
     uint256 constant PAYOUT_AMOUNT = 200e6; // 200 USDC
     uint256 constant MIN_BET = 10e6; // 10 USDC
+    uint256 constant MAX_BET = 10e8; // 1000 USDC
 
     // Events to test - Updated to match new contract
     event GameCreated(
@@ -34,7 +35,7 @@ contract CashCowTest is Test {
     event GameWon(bytes32 indexed gameId, address indexed player, uint256 amount, address indexed token);
     event GameLost(bytes32 indexed gameId, address indexed player);
     event GameExpired(bytes32 indexed gameId, address indexed player);
-    event MinBetUpdated(address indexed token, uint256 minBet);
+    event BetLimitsUpdated(address indexed token, uint256 min, uint256 max);
     event TreasuryDeposit(uint256 amount, address indexed token);
     event TreasuryWithdrawal(uint256 amount, address indexed token);
 
@@ -62,7 +63,7 @@ contract CashCowTest is Test {
         vm.startPrank(owner);
         usdc.approve(address(casino), INITIAL_TREASURY);
         casino.addToTreasury(INITIAL_TREASURY, address(usdc));
-        casino.updateMinBet(address(usdc), MIN_BET);
+        casino.updateBetLimits(address(usdc), MIN_BET, MAX_BET);
         vm.stopPrank();
     }
 
@@ -380,7 +381,7 @@ contract CashCowTest is Test {
     function testOnlyOwnerCanUpdateMinBet() public {
         vm.prank(player1);
         vm.expectRevert(); // Ownable: caller is not the owner
-        casino.updateMinBet(address(usdc), 50e6);
+        casino.updateBetLimits(address(usdc), 50e6, 100e6);
     }
 
     function testTreasuryWithdrawalRespectingLockedFunds() public {
@@ -637,13 +638,20 @@ contract CashCowTest is Test {
 
     function testUpdateMinBetAsOwner() public {
         address token = address(usdc);
-        uint256 newBet = 50e6;
+        uint256 newMinBet = 50e6;
+        uint256 newMaxBet = 100e6;
 
         vm.prank(owner);
         vm.expectEmit(true, true, false, true);
-        emit MinBetUpdated(token, newBet);
-        casino.updateMinBet(token, newBet);
-        assertEq(casino.minBets(token), newBet);
+        emit BetLimitsUpdated(token, newMinBet, newMaxBet);
+        casino.updateBetLimits(token, newMinBet, newMaxBet);
+        (uint256 minBet, uint256 maxBet) = casino.betLimits(token);
+        assertEq(minBet, newMinBet);
+        assertEq(maxBet, newMaxBet);
+
+        vm.prank(owner);
+        vm.expectRevert(CashCow.InvalidBetLimits.selector);
+        casino.updateBetLimits(token, newMaxBet, newMinBet);
     }
 
     function testAddToTreasuryAsOwner() public {

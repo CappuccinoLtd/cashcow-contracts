@@ -38,6 +38,12 @@ contract CashCow is Ownable, EIP712 {
         string gameSeed; // Seed used to generate the game random result
     }
 
+    /// @notice Bet limits for each token
+    struct BetLimits {
+        uint256 minBet;
+        uint256 maxBet;
+    }
+
     /// @notice Mapping from on-chain game ID to Game data
     mapping(bytes32 => Game) public games;
 
@@ -48,7 +54,7 @@ contract CashCow is Ownable, EIP712 {
     mapping(address => uint256) public locked;
 
     /// @notice Minimum bet per token
-    mapping(address => uint256) public minBets;
+    mapping(address => BetLimits) public betLimits;
 
     // ===================
     // Events
@@ -69,8 +75,8 @@ contract CashCow is Ownable, EIP712 {
     event GameLost(bytes32 indexed gameId, address indexed player);
     event GameExpired(bytes32 indexed gameId, address indexed player);
 
-    /// @notice Min bets updated
-    event MinBetUpdated(address indexed token, uint256 minBet);
+    /// @notice Bet limits updated
+    event BetLimitsUpdated(address indexed token, uint256 minBet, uint256 maxBet);
 
     /// @notice Treasury events
     event TreasuryDeposit(uint256 amount, address indexed token);
@@ -97,6 +103,9 @@ contract CashCow is Ownable, EIP712 {
 
     /// @notice Error when the bet is invalid (null or too low)
     error InvalidBet();
+
+    /// @notice Error when the updated bet limits are invalid
+    error InvalidBetLimits();
 
     /// @notice Error if the payout amount is null
     error InvalidPayout();
@@ -319,9 +328,10 @@ contract CashCow is Ownable, EIP712 {
     // Admin Functions
     // ===================
 
-    function updateMinBet(address token, uint256 bet) external onlyOwner {
-        minBets[token] = bet;
-        emit MinBetUpdated(token, bet);
+    function updateBetLimits(address token, uint256 min, uint256 max) external onlyOwner {
+        if (max < min) revert InvalidBetLimits();
+        betLimits[token] = BetLimits(min, max);
+        emit BetLimitsUpdated(token, min, max);
     }
 
     function addToTreasury(uint256 amount, address token) external onlyOwner {
@@ -352,7 +362,8 @@ contract CashCow is Ownable, EIP712 {
         bytes calldata serverSignature,
         uint256 deadline
     ) internal view {
-        if (betAmount == 0 || betAmount < minBets[betToken]) revert InvalidBet();
+        BetLimits memory limits = betLimits[betToken];
+        if (betAmount < limits.minBet || betAmount > limits.maxBet) revert InvalidBet();
         if (treasury[betToken] - locked[betToken] < betAmount) revert InsufficientFunds();
         if (games[gameId].betAmount != 0) revert GameAlreadyExists();
 
